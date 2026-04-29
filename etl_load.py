@@ -1,304 +1,279 @@
 """
-ETL  –  food_delivery_dataset.csv  →  MySQL (food_delivery)
-============================================================
-Run:
-    python etl_load.py                           # uses defaults below
-    python etl_load.py --csv path/to/file.csv    # custom path
+ETL: Food Delivery dataset → MySQL
+====================================
 
-Requirements:
-    pip install pandas mysql-connector-python python-dotenv
+Reads the raw CSV, cleans it, and inserts everything into the
+`food_delivery` database created by 01_schema.sql.
+
+USAGE:
+    1. Run 01_schema.sql in MySQL Workbench first.
+    2. Copy .env.example to .env and fill in your credentials.
+    3. python etl_load.py
+
+The script is idempotent: it uses INSERT IGNORE everywhere, so you
+can re-run it safely. It also wraps each table load in a transaction.
 """
 
-import argparse
 import os
 import sys
+from pathlib import Path
+
 import pandas as pd
 import mysql.connector
 from mysql.connector import Error
 from dotenv import load_dotenv
 
-# ── Config ────────────────────────────────────────────────────────────────────
-load_dotenv()                          # optional: store creds in .env
+# ── Configuration ─────────────────────────────────────────────
+load_dotenv()
+
+CSV_PATH = Path(__file__).parent / "food_delivery_dataset.csv"
 
 DB_CONFIG = {
-    "host":     os.getenv("DB_HOST",     "localhost"),
-    "port":     int(os.getenv("DB_PORT", 3306)),
-    "user":     os.getenv("DB_USER",     "root"),
+    "host":     os.getenv("DB_HOST", "localhost"),
+    "port":     int(os.getenv("DB_PORT", "3306")),
+    "user":     os.getenv("DB_USER", "root"),
     "password": os.getenv("DB_PASSWORD", ""),
-    "database": os.getenv("DB_NAME",     "food_delivery"),
-    "autocommit": False,
+    "database": os.getenv("DB_NAME", "food_delivery"),
 }
 
-DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "..", "data", "food_delivery_dataset.csv")
-BATCH_SIZE  = 500   # rows per INSERT batch
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────
+def to_bool(value) -> bool:
+    """Map any 'truthy' representation to a real boolean."""
+    if isinstance(value, bool):
+        return value
+    if pd.isna(value):
+        return False
+    s = str(value).strip().lower()
+    return s in ("yes", "true", "1", "y", "t")
 
-def get_connection():
+
+def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """All cleaning happens here, in one place."""
+    print(f"[clean] starting with {len(df):,} rows")
+
+    # 1. strip whitespace from string columns
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].astype(str).str.strip()
+
+    # 2. parse datetime columns; bad values → NaT (will become NULL)
+    df["order_time"]    = pd.to_datetime(df["order_time"],    errors="coerce")
+    df["delivery_time"] = pd.to_datetime(df["delivery_time"], errors="coerce")
+
+    # 3. coerce numeric columns
+    df["age"]              = pd.to_numeric(df["age"], errors="coerce").clip(0, 120)
+    df["order_value"]      = pd.to_numeric(df["order_value"], errors="coerce").clip(lower=0)
+    df["delivery_distance"]= pd.to_numeric(df["delivery_distance"], errors="coerce").clip(lower=0)
+    df["delivery_delay"]   = pd.to_numeric(df["delivery_delay"], errors="coerce")
+    df["route_efficiency"] = pd.to_numeric(df["route_efficiency"], errors="coerce").clip(0, 1)
+
+    # 4. boolean coercion
+    df["loyalty_program"]     = df["loyalty_program"].apply(to_bool)
+    df["small_route"]         = df["small_route"].apply(to_bool)
+    df["bike_friendly_route"] = df["bike_friendly_route"].apply(to_bool)
+    df["traffic_avoidance"]   = df["traffic_avoidance"].apply(to_bool)
+
+    # 5. drop rows missing critical foreign keys
+    before = len(df)
+    df = df.dropna(subset=["order_id", "customer_id", "restaurant_id", "order_time"])
+    print(f"[clean] dropped {before - len(df)} rows with missing critical keys")
+
+    # 6. deduplicate on the natural primary key
+    before = len(df)
+    df = df.drop_duplicates(subset=["order_id"])
+    print(f"[clean] dropped {before - len(df)} duplicate order_ids")
+
+    print(f"[clean] finished with {len(df):,} rows")
+    return df
+
+
+def batch_insert(cursor, sql: str, rows: list, label: str, batch_size: int = 1000):
+    """Insert rows in batches and report progress."""
+    total = len(rows)
+    if total == 0:
+        print(f"  [{label}] nothing to insert")
+        return
+    for i in range(0, total, batch_size):
+        cursor.executemany(sql, rows[i:i + batch_size])
+    print(f"  [{label}] inserted {total:,} rows")
+
+
+# ── Main ETL ──────────────────────────────────────────────────
+def main():
+    if not CSV_PATH.exists():
+        sys.exit(f"❌ CSV not found at {CSV_PATH}")
+
+    print("=" * 60)
+    print("FOOD DELIVERY ETL")
+    print("=" * 60)
+
+    # 1. load + clean
+    df = pd.read_csv(CSV_PATH)
+    df = clean_dataset(df)
+
+    # 2. connect to MySQL
+    print(f"\n[db] connecting to {DB_CONFIG['user']}@{DB_CONFIG['host']}:{DB_CONFIG['port']} / {DB_CONFIG['database']}")
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
-        print(f"[DB] Connected to {DB_CONFIG['database']} on {DB_CONFIG['host']}")
-        return conn
     except Error as e:
-        sys.exit(f"[DB] Connection failed: {e}")
+        sys.exit(f"❌ connection failed: {e}")
 
-
-def executemany_batch(cursor, sql: str, rows: list, batch_size: int = BATCH_SIZE):
-    """Insert rows in batches and return total inserted."""
-    total = 0
-    for i in range(0, len(rows), batch_size):
-        cursor.executemany(sql, rows[i : i + batch_size])
-        total += cursor.rowcount
-    return total
-
-
-# ── Cleaning ──────────────────────────────────────────────────────────────────
-
-def clean(df: pd.DataFrame) -> pd.DataFrame:
-    print(f"[ETL] Raw rows: {len(df)}")
-
-    # ── Booleans ──────────────────────────────────────────────────────────────
-    for col in ("loyalty_program", "small_route", "bike_friendly_route", "traffic_avoidance"):
-        if col in df.columns:
-            df[col] = df[col].map(
-                lambda v: True if str(v).strip().lower() in ("yes", "true", "1") else False
-            )
-
-    # ── Datetimes ─────────────────────────────────────────────────────────────
-    for col in ("order_time", "delivery_time"):
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-
-    # ── Numeric clamp / coerce ────────────────────────────────────────────────
-    df["age"]               = pd.to_numeric(df["age"],               errors="coerce").clip(0, 120)
-    df["order_history"]     = pd.to_numeric(df["order_history"],     errors="coerce").clip(0)
-    df["delivery_distance"] = pd.to_numeric(df["delivery_distance"], errors="coerce").clip(0)
-    df["delivery_delay"]    = pd.to_numeric(df["delivery_delay"],    errors="coerce")
-    df["order_value"]       = pd.to_numeric(df["order_value"],       errors="coerce").clip(0)
-    df["route_efficiency"]  = pd.to_numeric(df["route_efficiency"],  errors="coerce").clip(0, 1)
-
-    for col in ("customer_rating", "customer_satisfaction", "food_freshness", "packaging_quality"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # ── Strings: strip whitespace ─────────────────────────────────────────────
-    str_cols = df.select_dtypes("object").columns
-    df[str_cols] = df[str_cols].apply(lambda s: s.str.strip())
-
-    # ── Drop duplicates ───────────────────────────────────────────────────────
-    before = len(df)
-    df.drop_duplicates(subset=["order_id"], inplace=True)
-    print(f"[ETL] Dropped {before - len(df)} duplicate order_ids")
-
-    # ── Drop rows missing critical keys ───────────────────────────────────────
-    before = len(df)
-    df.dropna(subset=["order_id", "customer_id", "restaurant_id"], inplace=True)
-    print(f"[ETL] Dropped {before - len(df)} rows with null PKs/FKs")
-
-    print(f"[ETL] Clean rows: {len(df)}")
-    return df.reset_index(drop=True)
-
-
-# ── Loaders ───────────────────────────────────────────────────────────────────
-
-def load_locations(cursor, df) -> dict:
-    cities = df["location"].dropna().unique().tolist()
-    cursor.executemany(
-        "INSERT IGNORE INTO locations (city) VALUES (%s)",
-        [(c,) for c in cities],
-    )
-    cursor.execute("SELECT location_id, city FROM locations")
-    return {row[1]: row[0] for row in cursor.fetchall()}
-
-
-def load_cuisines(cursor, df) -> dict:
-    names = df["preferred_cuisine"].dropna().unique().tolist()
-    cursor.executemany(
-        "INSERT IGNORE INTO cuisines (cuisine_name) VALUES (%s)",
-        [(n,) for n in names],
-    )
-    cursor.execute("SELECT cuisine_id, cuisine_name FROM cuisines")
-    return {row[1]: row[0] for row in cursor.fetchall()}
-
-
-def load_routes(cursor, df) -> dict:
-    route_df = (
-        df[["route_taken", "route_type", "small_route", "bike_friendly_route"]]
-        .dropna(subset=["route_taken"])
-        .drop_duplicates(subset=["route_taken"])
-    )
-    rows = [
-        (r.route_taken, r.route_type, bool(r.small_route), bool(r.bike_friendly_route))
-        for r in route_df.itertuples(index=False)
-    ]
-    cursor.executemany(
-        """INSERT IGNORE INTO routes (route_name, route_type, small_route, bike_friendly)
-           VALUES (%s, %s, %s, %s)""",
-        rows,
-    )
-    cursor.execute("SELECT route_id, route_name FROM routes")
-    return {row[1]: row[0] for row in cursor.fetchall()}
-
-
-def load_restaurants(cursor, df):
-    ids = df["restaurant_id"].dropna().unique().tolist()
-    cursor.executemany(
-        "INSERT IGNORE INTO restaurants (restaurant_id) VALUES (%s)",
-        [(int(i),) for i in ids],
-    )
-
-
-def load_customers(cursor, df, loc_map, cui_map):
-    cust_df = (
-        df[["customer_id", "age", "gender", "location",
-            "order_history", "order_frequency", "loyalty_program", "preferred_cuisine"]]
-        .drop_duplicates(subset=["customer_id"])
-    )
-    rows = [
-        (
-            r.customer_id,
-            None if pd.isna(r.age) else int(r.age),
-            r.gender if pd.notna(r.gender) else None,
-            loc_map.get(r.location),
-            None if pd.isna(r.order_history) else int(r.order_history),
-            r.order_frequency if pd.notna(r.order_frequency) else None,
-            bool(r.loyalty_program),
-            cui_map.get(r.preferred_cuisine),
-        )
-        for r in cust_df.itertuples(index=False)
-    ]
-    n = executemany_batch(
-        cursor,
-        """INSERT IGNORE INTO customers
-           (customer_id, age, gender, location_id, order_history,
-            order_frequency, loyalty_program, cuisine_id)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-        rows,
-    )
-    print(f"[ETL] Customers inserted: {n}")
-
-
-def load_orders(cursor, df):
-    rows = [
-        (
-            r.order_id,
-            r.customer_id,
-            int(r.restaurant_id),
-            None if pd.isnull(r.order_time) else r.order_time.to_pydatetime(),
-            None if pd.isna(r.order_value) else float(r.order_value),
-            r.delivery_method if pd.notna(r.delivery_method) else None,
-        )
-        for r in df.itertuples(index=False)
-    ]
-    n = executemany_batch(
-        cursor,
-        """INSERT IGNORE INTO orders
-           (order_id, customer_id, restaurant_id, order_time, order_value, delivery_method)
-           VALUES (%s,%s,%s,%s,%s,%s)""",
-        rows,
-    )
-    print(f"[ETL] Orders inserted: {n}")
-
-
-def load_order_items(cursor, df):
-    rows = [
-        (r.order_id, r.food_item if pd.notna(r.food_item) else None)
-        for r in df.itertuples(index=False)
-        if pd.notna(getattr(r, "food_item", None))
-    ]
-    n = executemany_batch(
-        cursor,
-        "INSERT INTO order_items (order_id, food_item) VALUES (%s,%s)",
-        rows,
-    )
-    print(f"[ETL] Order items inserted: {n}")
-
-
-def load_deliveries(cursor, df, route_map):
-    rows = []
-    for r in df.itertuples(index=False):
-        rows.append((
-            r.order_id,
-            None if pd.isnull(r.delivery_time) else r.delivery_time.to_pydatetime(),
-            None if pd.isna(r.delivery_distance) else float(r.delivery_distance),
-            None if pd.isna(r.delivery_delay)    else float(r.delivery_delay),
-            r.traffic_condition  if pd.notna(r.traffic_condition)  else None,
-            r.weather_condition  if pd.notna(r.weather_condition)  else None,
-            route_map.get(r.route_taken),
-            None if pd.isna(r.route_efficiency) else float(r.route_efficiency),
-            bool(r.traffic_avoidance),
-        ))
-    n = executemany_batch(
-        cursor,
-        """INSERT IGNORE INTO deliveries
-           (order_id, delivery_time, delivery_distance, delivery_delay,
-            traffic_condition, weather_condition, route_id,
-            route_efficiency, traffic_avoidance)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        rows,
-    )
-    print(f"[ETL] Deliveries inserted: {n}")
-
-
-def load_feedback(cursor, df):
-    rows = [
-        (
-            r.order_id,
-            None if pd.isna(r.customer_rating)       else int(r.customer_rating),
-            None if pd.isna(r.customer_satisfaction)  else int(r.customer_satisfaction),
-            r.food_temperature if pd.notna(r.food_temperature) else None,
-            None if pd.isna(r.food_freshness)         else int(r.food_freshness),
-            None if pd.isna(r.packaging_quality)      else int(r.packaging_quality),
-            r.food_condition   if pd.notna(r.food_condition)   else None,
-        )
-        for r in df.itertuples(index=False)
-    ]
-    n = executemany_batch(
-        cursor,
-        """INSERT IGNORE INTO feedback
-           (order_id, customer_rating, customer_satisfaction, food_temperature,
-            food_freshness, packaging_quality, food_condition)
-           VALUES (%s,%s,%s,%s,%s,%s,%s)""",
-        rows,
-    )
-    print(f"[ETL] Feedback inserted: {n}")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def run(csv_path: str):
-    df = pd.read_csv(csv_path)
-    df = clean(df)
-
-    conn = get_connection()
-    cur  = conn.cursor()
+    cursor = conn.cursor()
 
     try:
-        print("[ETL] Loading lookup tables …")
-        loc_map   = load_locations(cur, df)
-        cui_map   = load_cuisines(cur, df)
-        route_map = load_routes(cur, df)
-        load_restaurants(cur, df)
+        # ── 3. lookup tables ───────────────────────────────
+        print("\n[load] lookup tables")
 
-        print("[ETL] Loading dimension tables …")
-        load_customers(cur, df, loc_map, cui_map)
+        cities = sorted(df["location"].dropna().unique().tolist())
+        batch_insert(cursor,
+                     "INSERT IGNORE INTO locations (city) VALUES (%s)",
+                     [(c,) for c in cities],
+                     "locations")
 
-        print("[ETL] Loading fact tables …")
-        load_orders(cur, df)
-        load_order_items(cur, df)
-        load_deliveries(cur, df, route_map)
-        load_feedback(cur, df)
+        cuisines = sorted(df["preferred_cuisine"].dropna().unique().tolist())
+        batch_insert(cursor,
+                     "INSERT IGNORE INTO cuisines (cuisine_name) VALUES (%s)",
+                     [(c,) for c in cuisines],
+                     "cuisines")
 
+        # routes — derived (one row per unique route_taken)
+        route_rows = (
+            df[["route_taken", "route_type", "small_route", "bike_friendly_route"]]
+            .drop_duplicates(subset=["route_taken"])
+            .sort_values("route_taken")
+            .values.tolist()
+        )
+        batch_insert(cursor,
+                     """INSERT IGNORE INTO routes
+                        (route_name, route_type, small_route, bike_friendly)
+                        VALUES (%s, %s, %s, %s)""",
+                     route_rows,
+                     "routes")
+
+        # ── 4. lookup id mappings ───────────────────────────
+        cursor.execute("SELECT location_id, city FROM locations")
+        loc_map = {city: lid for lid, city in cursor.fetchall()}
+
+        cursor.execute("SELECT cuisine_id, cuisine_name FROM cuisines")
+        cui_map = {name: cid for cid, name in cursor.fetchall()}
+
+        cursor.execute("SELECT route_id, route_name FROM routes")
+        rou_map = {name: rid for rid, name in cursor.fetchall()}
+
+        # ── 5. dimension tables ─────────────────────────────
+        print("\n[load] dimension tables")
+
+        restaurants = sorted(df["restaurant_id"].dropna().unique().tolist())
+        batch_insert(cursor,
+                     "INSERT IGNORE INTO restaurants (restaurant_id) VALUES (%s)",
+                     [(int(r),) for r in restaurants],
+                     "restaurants")
+
+        # one row per unique customer
+        customer_rows = (
+            df.drop_duplicates(subset=["customer_id"])
+              .apply(lambda r: (
+                  r["customer_id"],
+                  int(r["age"]) if pd.notna(r["age"]) else None,
+                  r["gender"],
+                  loc_map.get(r["location"]),
+                  int(r["order_history"]) if pd.notna(r["order_history"]) else None,
+                  r["order_frequency"],
+                  bool(r["loyalty_program"]),
+                  cui_map.get(r["preferred_cuisine"]),
+              ), axis=1)
+              .tolist()
+        )
+        batch_insert(cursor,
+                     """INSERT IGNORE INTO customers
+                        (customer_id, age, gender, location_id, order_history,
+                         order_frequency, loyalty_program, cuisine_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                     customer_rows,
+                     "customers")
+
+        # ── 6. fact tables ──────────────────────────────────
+        print("\n[load] fact tables")
+
+        order_rows = df.apply(lambda r: (
+            r["order_id"],
+            r["customer_id"],
+            int(r["restaurant_id"]),
+            r["order_time"].to_pydatetime() if pd.notna(r["order_time"]) else None,
+            float(r["order_value"]) if pd.notna(r["order_value"]) else 0.0,
+            r["delivery_method"],
+        ), axis=1).tolist()
+        batch_insert(cursor,
+                     """INSERT IGNORE INTO orders
+                        (order_id, customer_id, restaurant_id,
+                         order_time, order_value, delivery_method)
+                        VALUES (%s, %s, %s, %s, %s, %s)""",
+                     order_rows,
+                     "orders")
+
+        item_rows = df[["order_id", "food_item"]].values.tolist()
+        batch_insert(cursor,
+                     "INSERT IGNORE INTO order_items (order_id, food_item) VALUES (%s, %s)",
+                     [(o, f) for o, f in item_rows],
+                     "order_items")
+
+        delivery_rows = df.apply(lambda r: (
+            r["order_id"],
+            r["delivery_time"].to_pydatetime() if pd.notna(r["delivery_time"]) else None,
+            float(r["delivery_distance"]) if pd.notna(r["delivery_distance"]) else None,
+            float(r["delivery_delay"])    if pd.notna(r["delivery_delay"])    else None,
+            r["traffic_condition"],
+            r["weather_condition"],
+            rou_map.get(r["route_taken"]),
+            float(r["route_efficiency"]) if pd.notna(r["route_efficiency"]) else None,
+            bool(r["traffic_avoidance"]),
+        ), axis=1).tolist()
+        batch_insert(cursor,
+                     """INSERT IGNORE INTO deliveries
+                        (order_id, delivery_time, delivery_distance, delivery_delay,
+                         traffic_condition, weather_condition, route_id,
+                         route_efficiency, traffic_avoidance)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                     delivery_rows,
+                     "deliveries")
+
+        feedback_rows = df.apply(lambda r: (
+            r["order_id"],
+            int(r["customer_rating"])       if pd.notna(r["customer_rating"])       else None,
+            int(r["customer_satisfaction"]) if pd.notna(r["customer_satisfaction"]) else None,
+            r["food_temperature"],
+            int(r["food_freshness"])    if pd.notna(r["food_freshness"])    else None,
+            int(r["packaging_quality"]) if pd.notna(r["packaging_quality"]) else None,
+            r["food_condition"],
+        ), axis=1).tolist()
+        batch_insert(cursor,
+                     """INSERT IGNORE INTO feedback
+                        (order_id, customer_rating, customer_satisfaction,
+                         food_temperature, food_freshness, packaging_quality,
+                         food_condition)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                     feedback_rows,
+                     "feedback")
+
+        # commit everything
         conn.commit()
-        print("[ETL] ✅  All data committed.")
-    except Exception as e:
+        print("\n✅ all data committed")
+
+        # ── 7. final row counts ─────────────────────────────
+        print("\n[verify] final row counts")
+        for tbl in ["locations", "cuisines", "routes", "restaurants",
+                    "customers", "orders", "order_items", "deliveries", "feedback"]:
+            cursor.execute(f"SELECT COUNT(*) FROM {tbl}")
+            (cnt,) = cursor.fetchone()
+            print(f"  {tbl:<14} {cnt:>8,}")
+
+    except Error as e:
         conn.rollback()
-        raise RuntimeError(f"[ETL] ❌  Rolled back due to: {e}") from e
+        sys.exit(f"\n❌ ETL failed, rolled back: {e}")
     finally:
-        cur.close()
+        cursor.close()
         conn.close()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Load food-delivery CSV into MySQL")
-    parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to the CSV file")
-    args = parser.parse_args()
-    run(args.csv)
+    main()
